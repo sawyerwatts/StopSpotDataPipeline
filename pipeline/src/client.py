@@ -137,42 +137,23 @@ class _Client():
     # supplied, this will prompt the user for them.
     def process_data(self, start_date=None, end_date=None, restart=False):
         self._ios.log_and_print("Starting data processing pipeline.")
-        start_date, end_date = self._get_date_range(start_date, end_date)
-        ctran_df = self.ctran.query_date_range(start_date, end_date)
-        if ctran_df is None or ctran_df.empty:
-            self._ios.log_and_print(
-                "The supplied dates were unable to be gathered from CTran data.",
-                self._ios.Severity.ERROR)
+        ctran_df = self._build_ctran_df(start_date, end_date)
+        if ctran_df is None:
             return False
-
         flagged_rows = []
         skipped_rows = 0
-
         csv_service_keys = []
-
         duplicate = None
+
         self._ios.log_and_print("Processing the queried data.")
-        progress_bar = Bar(
-            "",
-            max=len(ctran_df.index))
+        progress_bar = Bar("", max=len(ctran_df.index))
         for row_id, row in ctran_df.iterrows():
 
-            if self._output_type == "csv" or self._output_type == "both":
-                if not row.service_date in csv_service_keys:
-                    csv_service_keys.append(row.service_date)
-
+            self._csv_update(csv_service_keys, row)
             service_key = self.service_periods.query_or_insert(row.service_date)
-
-            if restart:
-                if config.get_value("max_skipped_rows"):
-                    if skipped_rows > config.get_value("max_skipped_rows"):
-                        msg = self._ios.log_and_print(
-                            "Exceeded maximum number of skipped service rows.",
-                            self._ios.Severity.DEBUG)
-                        restarter.critical_error(msg)
+            self._should_pipeline_restart(restart, skipped_rows)
 
             # If this fails, it's very likely a sqlalchemy error.
-            # e.g. not able to connect to db.
             if not service_key:
                 self._ios.log_and_print(
                     "Cannot find or create new service_key, skipping.",
@@ -182,44 +163,17 @@ class _Client():
 
             flags = set()
             for flagger in flaggers:
-                try:
-                    # Duplicate flagger requires a special call later on,
-                    # independent of this loop.
-                    if flagger.name == "Duplicate":
-                        duplicate = flagger
-                    else:
-                        flags.update(flagger.flag(row, config))
-                except Exception as e:
-                    self._ios.log_and_print(
-                        "Error in flagger {}. Skipping.\n{}".format(flagger.name, e),
-                        self._ios.Severity.WARNING)
+                result = self._flag_row(flagger, row, flags)
+                if result is not None:
+                    duplicate = result
 
-            date = row["service_date"]
-            date = "".join([str(date.year), "/", str(date.month), "/", str(date.day)])
-            for flag in flags:
-                flagged_rows.append([
-                    row_id,
-                    service_key,
-                    int(flag),
-                    date
-                ])
+            self._updated_flagged_rows(flags, flagged_rows, row, row_id, service_key)
             progress_bar.next()
 
         progress_bar.finish()
-        # Duplicate flagger requires a special call later on, independent of
-        # the primary loop.
-        if duplicate is not None:
-            self._ios.log_and_print("Checking for duplicates.")
-            flagged_rows.extend(self._flag_duplicates(ctran_df, duplicate))
-        else:
-            self._ios.log_and_print(
-                "This run is not checking for duplicates.",
-                self._ios.Severity.WARNING)
-
+        self._check_duplicated_rows(flagged_rows, duplicate, ctran_df)
         self._save_output(flagged_rows, csv_service_keys)
-
         self._ios.log_and_print("Done executing the pipeline.")
-
         return True
 
     ###########################################################
@@ -340,6 +294,108 @@ class _Client():
 
         for row in df.itertuples():
             self._flag_lookup[row.name] = FlagInfo(row.flag_id, row.description)
+
+    #######################################################
+
+    # Helper to process_data()
+    # If None is returned, then this has already logged the error and the
+    # parent just needs to exit.
+    def _build_ctran_df(self, start_date, end_date):
+        start_date, end_date = self._get_date_range(start_date, end_date)
+        ctran_df = self.ctran.query_date_range(start_date, end_date)
+        if ctran_df is None or ctran_df.empty:
+            self._ios.log_and_print(
+                "The supplied dates were unable to be gathered from CTran data.",
+                self._ios.Severity.ERROR)
+            return None
+        return ctran_df
+
+    #######################################################
+
+    # Helper to process_data()
+    def _csv_update(self, csv_service_keys, row):
+        if self._output_type == "csv" or self._output_type == "both":
+            if not row.service_date in csv_service_keys:
+                csv_service_keys.append(row.service_date)
+
+    #######################################################
+
+    # Helper to process_data()
+    def _should_pipeline_restart(self, restart, skipped_rows):
+        if not restart:
+            return
+
+        max_skipped_rows = config.get_value("max_skipped_rows")
+        if max_skipped_rows is None:
+            return
+
+        if skipped_rows <= config.get_value("max_skipped_rows"):
+            return
+
+        msg = self._ios.log_and_print(
+            "Exceeded maximum number of skipped service rows.",
+            self._ios.Severity.DEBUG)
+        restarter.critical_error(msg)
+
+    #######################################################
+
+    # Helper to process_data()
+    def _flag_row(self, flagger, row, flags):
+        duplicate = None
+        try:
+            # Duplicate flagger requires a special call later on,
+            # independent of this loop.
+            if flagger.name == "Duplicate":
+                duplicate = flagger
+            else:
+                flags.update(flagger.flag(row, config))
+
+        except Exception as e:
+            self._ios.log_and_print(
+                "Error in flagger {}. Skipping.\n{}".format(flagger.name, e),
+                self._ios.Severity.WARNING)
+
+        return duplicate
+
+    #######################################################
+
+    # Helper to process_data()
+    def _updated_flagged_rows(self, flags, flagged_rows, row, row_id, service_key):
+        date = row["service_date"]
+        date = "".join([str(date.year), "/", str(date.month), "/", str(date.day)])
+        for flag in flags:
+            flagged_rows.append([
+                row_id,
+                service_key,
+                int(flag),
+                date
+            ])
+
+    #######################################################
+
+    # Helper to process_data()
+    # Duplicate flagger requires a special call later on, independent of the
+    # primary loop.
+    def _check_duplicated_rows(self, flagged_rows, duplicate, ctran_df):
+        if duplicate is not None:
+            self._ios.log_and_print("Checking for duplicates.")
+            flagged_rows.extend(self._flag_duplicates(ctran_df, duplicate))
+        else:
+            self._ios.log_and_print(
+                "This run is not checking for duplicates.",
+                self._ios.Severity.WARNING)
+
+    ###########################################################
+
+    # Helper to process_data()
+    def _save_output(self, flagged_rows, csv_service_keys):
+        if self._output_type == "aperture" or self._output_type == "both":
+            self.flagged.write_table(flagged_rows)
+
+        if self._output_type == "csv" or self._output_type == "both":
+            self.flags.write_csv(self._output_path)
+            self.flagged.write_csv(self._output_path, flagged_rows)
+            self.service_periods.write_csv(self._output_path, csv_service_keys)
 
     #######################################################
 
@@ -529,11 +585,3 @@ class _Client():
 
         return self._menu("This is output type sub-menu.", options)
 
-    def _save_output(self, flagged_rows, csv_service_keys):
-        if self._output_type == "aperture" or self._output_type == "both":
-            self.flagged.write_table(flagged_rows)
-
-        if self._output_type == "csv" or self._output_type == "both":
-            self.flags.write_csv(self._output_path)
-            self.flagged.write_csv(self._output_path, flagged_rows)
-            self.service_periods.write_csv(self._output_path, csv_service_keys)

@@ -1,6 +1,10 @@
 # TeamBeeCapstoneProject
 
-Repository for Portland State University Winter-Spring Team Bees capstone project.
+Repository for Portland State University Winter-Spring Team Bees capstone
+project.
+
+Despite several attempts to bring it up, coding conventions were never agreed
+on, and I am so sorry to anyone that has to maintain this.
 
 ## Setup
 
